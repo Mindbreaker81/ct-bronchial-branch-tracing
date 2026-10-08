@@ -389,6 +389,28 @@ Check the result before doing anything else:
 A centreline is a mathematical path through the segmentation. It is only
 as anatomically valid as the segmentation from which it was calculated.
 
+### Built-in safety checks
+
+The start and target points are chosen from a list of all markup nodes;
+the names above are a convention. The script then:
+
+-   stops if either point is more than 5 mm from the selected airway
+    segment (`MAX_START_SNAP_MM`, `MAX_TARGET_SNAP_MM`), instead of
+    snapping it to an unrelated airway voxel;
+-   only proposes bridges to fragments that lie closer to the target
+    than the start-connected airway already reaches, so isolated
+    fragments behind or beside the route are never bridged;
+-   centres the slice views on each proposed gap before asking for
+    authorisation;
+-   constrains the smoothed route to the Start-to-Target connected
+    component only, not to every fragment of the navigation mask;
+-   reports how many final route points lie outside that component and
+    stores the count in `BBT.PointsOutsideRouteComponent`.
+
+Projection keeps points inside the airway but places corrected points
+at the wall, not at the lumen centre. A non-zero outside count, or any
+projected points near a bifurcation, requires review on CT.
+
 ------------------------------------------------------------------------
 
 ## 11. Create the virtual bronchoscopy
@@ -412,6 +434,34 @@ confirm that the selected branch is the intended CT-supported branch.
 A virtual bronchoscopy view is a rendering of the CT-derived model. It
 is **not** the same as the live endoscopic view and is not real-time
 localisation.
+
+### Route direction
+
+Routes created by script 3 carry `BBT.RouteDirection = StartToTarget`
+and are played in that order. Other curves named `Route_Centerline`
+fall back to a heuristic that prefers initial head-to-feet travel;
+check the "Route direction" line in the console.
+
+### Bifurcation markers (optional)
+
+Before running script 4, a point can be placed at each bifurcation:
+
+1.  Create one markup point list per bifurcation and name the **node**
+    `B1`, `B2`, `B3`…; events are ordered by their position along the
+    route, not by number.
+2.  Place the first control point at the bifurcation, within 10 mm of
+    the route (`MAX_MARKER_DISTANCE_MM`); farther markers are ignored.
+3.  Set the description of that control point to the desired clock
+    position only, for example `3`. Descriptions with no value, or with
+    more than one different number from 1 to 12, are ignored with a
+    warning.
+
+The camera roll convention is described in
+`scripts/BBT_Slicer_SKILL.md`. Markers are teaching events chosen by the
+operator; they are not automatic anatomical labels.
+
+The scripts do not read the lesion markup; it is a reference for the
+operator when placing `RouteTarget`.
 
 ------------------------------------------------------------------------
 
