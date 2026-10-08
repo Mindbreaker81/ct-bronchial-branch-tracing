@@ -24,7 +24,7 @@
 # 8. Skeletonise connected airway
 # 9. Extract shortest Start -> Target skeleton path
 # 10. Smooth path strongly to represent general airway direction
-# 11. Constrain smoothed path to combined navigation mask
+# 11. Constrain smoothed path to the Start-Target route component
 # 12. Create Route_Centerline
 #
 # OUTPUTS
@@ -89,6 +89,20 @@ BRIDGE_SAMPLES_PER_MM = 5.0
 
 
 # =====================================================================
+# MARKUP SNAPPING SETTINGS
+# =====================================================================
+
+# Maximum permitted distance from RouteStart / RouteTarget to the
+# nearest voxel of the selected airway segment.
+#
+# Larger distances abort instead of silently snapping the route
+# end to an unrelated airway voxel.
+MAX_START_SNAP_MM = 5.0
+
+MAX_TARGET_SNAP_MM = 5.0
+
+
+# =====================================================================
 # SMOOTHING SETTINGS
 # =====================================================================
 
@@ -127,6 +141,85 @@ def removeNodeIfExists(name):
 
     if node:
         slicer.mrmlScene.RemoveNode(node)
+
+
+def minimumDistanceMM(
+    coordinatesKJI,
+    pointKJI,
+    spacingKJI
+):
+    """Smallest physical distance from voxel coordinates to a point."""
+
+    delta = (
+        np.asarray(coordinatesKJI, dtype=float)
+        -
+        np.asarray(pointKJI, dtype=float)
+    ) * np.asarray(spacingKJI, dtype=float)
+
+    return float(
+        np.sqrt(
+            np.min(
+                np.sum(
+                    delta * delta,
+                    axis=1
+                )
+            )
+        )
+    )
+
+
+def makesProgressTowardsTarget(
+    candidateCoordinatesKJI,
+    startTargetDistanceMM,
+    targetKJI,
+    spacingKJI
+):
+    """
+    True when the candidate component reaches closer to the target
+    than the start-connected component already does
+    (startTargetDistanceMM).
+
+    Components lying behind or beside the current route front are
+    never bridged, so isolated fragments cannot consume bridges.
+    """
+
+    return (
+        minimumDistanceMM(
+            candidateCoordinatesKJI,
+            targetKJI,
+            spacingKJI
+        )
+        <
+        startTargetDistanceMM
+    )
+
+
+def pointsOutsideMask(
+    pointsKJI,
+    mask
+):
+    """Number of points whose nearest voxel is outside the mask."""
+
+    indices = np.round(
+        np.asarray(pointsKJI, dtype=float)
+    ).astype(int)
+
+    outside = 0
+
+    for k, j, i in indices:
+
+        if not (
+            0 <= k < mask.shape[0]
+            and
+            0 <= j < mask.shape[1]
+            and
+            0 <= i < mask.shape[2]
+            and
+            mask[k, j, i]
+        ):
+            outside += 1
+
+    return outside
 
 
 # =====================================================================
@@ -740,6 +833,25 @@ print(
 )
 
 
+if startDistance > MAX_START_SNAP_MM:
+
+    raise RuntimeError(
+        f"{startNode.GetName()} is {startDistance:.2f} mm "
+        f"from the airway (limit {MAX_START_SNAP_MM:.2f} mm). "
+        "Place it inside the tracheal lumen."
+    )
+
+
+if targetDistance > MAX_TARGET_SNAP_MM:
+
+    raise RuntimeError(
+        f"{targetNode.GetName()} is {targetDistance:.2f} mm "
+        f"from the airway (limit {MAX_TARGET_SNAP_MM:.2f} mm). "
+        "Place it inside the last CT-supported bronchus, "
+        "not at the lesion."
+    )
+
+
 # =====================================================================
 # WORKING MASK
 #
@@ -810,6 +922,14 @@ while True:
 
     startMask = (
         labels == startLabel
+    )
+
+    startTargetDistance = minimumDistanceMM(
+        np.argwhere(
+            startMask
+        ),
+        targetVoxel,
+        spacingKJI
     )
 
 
@@ -895,6 +1015,15 @@ while True:
         )
 
         if len(coords) == 0:
+            continue
+
+
+        if not makesProgressTowardsTarget(
+            coords,
+            startTargetDistance,
+            targetVoxel,
+            spacingKJI
+        ):
             continue
 
 
@@ -988,7 +1117,8 @@ while True:
     if bestComponent is None:
 
         raise RuntimeError(
-            "No suitable disconnected component found."
+            "No disconnected component lies closer to the target "
+            "than the start-connected airway."
         )
 
 
@@ -1044,12 +1174,37 @@ while True:
 
     # ================================================================
     # AUTHORISATION
+    #
+    # Centre the slice views on the gap so the CT can be inspected
+    # before deciding.
     # ================================================================
+
+    gapMidRAS = (
+        gapARAS + gapBRAS
+    ) / 2.0
+
+    try:
+        slicer.modules.markups.logic().JumpSlicesToLocation(
+            float(gapMidRAS[0]),
+            float(gapMidRAS[1]),
+            float(gapMidRAS[2]),
+            True
+        )
+        slicer.app.processEvents()
+    except Exception as error:
+        print(
+            "WARNING: could not centre slice views on gap:",
+            error
+        )
 
     text = (
         f"GAP {bridgeNumber:02d}\n\n"
 
         f"Gap length: {gapLength:.2f} mm\n\n"
+
+        "Slice views are centred on the gap midpoint "
+        f"(RAS {gapMidRAS[0]:.1f}, {gapMidRAS[1]:.1f}, "
+        f"{gapMidRAS[2]:.1f}). Check the CT before deciding.\n\n"
 
         "This geometric bridge is NOT CT-derived anatomy.\n\n"
 
@@ -1717,17 +1872,24 @@ smoothRoute[-1] = cleanRoute[-1]
 
 
 # =====================================================================
-# CONSTRAIN SPLINE TO COMBINED NAVIGATION MASK
+# CONSTRAIN SPLINE TO ROUTE COMPONENT
+#
+# Only the Start-to-Target connected component is used. Constraining
+# to the whole navigation mask could project points onto a
+# neighbouring branch or an isolated fragment.
+#
+# Projection moves a point to the nearest interior voxel, which lies
+# at the airway wall rather than the lumen centre.
 # =====================================================================
 
 print(
-    "Constraining smooth route to airway..."
+    "Constraining smooth route to route component..."
 )
 
 
 outsideDistance, nearestInside = (
     ndi.distance_transform_edt(
-        ~workingMask,
+        ~routeComponent,
         sampling=spacingKJI,
         return_indices=True
     )
@@ -1753,7 +1915,7 @@ for point in smoothRoute:
         np.clip(
             kji[0],
             0,
-            workingMask.shape[0] - 1
+            routeComponent.shape[0] - 1
         )
     )
 
@@ -1761,7 +1923,7 @@ for point in smoothRoute:
         np.clip(
             kji[1],
             0,
-            workingMask.shape[1] - 1
+            routeComponent.shape[1] - 1
         )
     )
 
@@ -1769,12 +1931,12 @@ for point in smoothRoute:
         np.clip(
             kji[2],
             0,
-            workingMask.shape[2] - 1
+            routeComponent.shape[2] - 1
         )
     )
 
 
-    if workingMask[
+    if routeComponent[
         k,
         j,
         i
@@ -1887,13 +2049,13 @@ if len(constrainedRoute) >= 7:
 
 
         if (
-            0 <= k < workingMask.shape[0]
+            0 <= k < routeComponent.shape[0]
             and
-            0 <= j < workingMask.shape[1]
+            0 <= j < routeComponent.shape[1]
             and
-            0 <= i < workingMask.shape[2]
+            0 <= i < routeComponent.shape[2]
             and
-            workingMask[
+            routeComponent[
                 k,
                 j,
                 i
@@ -2013,6 +2175,36 @@ finalRoute = np.asarray(
     finalRoute,
     dtype=float
 )
+
+
+# =====================================================================
+# VERIFY FINAL ROUTE AGAINST ROUTE COMPONENT
+#
+# Resampled points are linear interpolations between constrained
+# points and are not guaranteed to remain inside the airway.
+# =====================================================================
+
+finalPointsOutside = pointsOutsideMask(
+    [
+        rasToKJI(
+            point,
+            referenceVolume
+        )
+        for point in finalRoute
+    ],
+    routeComponent
+)
+
+if finalPointsOutside:
+
+    print(
+        "WARNING:",
+        finalPointsOutside,
+        "of",
+        len(finalRoute),
+        "final route points lie outside the route component. "
+        "Review Route_Centerline against the CT."
+    )
 
 
 # =====================================================================
@@ -2242,7 +2434,21 @@ routeCurve.SetAttribute(
 
 routeCurve.SetAttribute(
     "BBT.Constraint",
-    "Airway_NAVIGATION_COMBINED"
+    "Airway_NAVIGATION_COMBINED Start-Target component"
+)
+
+routeCurve.SetAttribute(
+    "BBT.PointsOutsideRouteComponent",
+    str(
+        finalPointsOutside
+    )
+)
+
+# Control points run from RouteStart to RouteTarget.
+# The virtual bronchoscopy script uses this instead of guessing.
+routeCurve.SetAttribute(
+    "BBT.RouteDirection",
+    "StartToTarget"
 )
 
 
@@ -2310,6 +2516,11 @@ print(
 print(
     "Spline points projected back into airway:",
     projectedPoints
+)
+
+print(
+    "Final points outside route component:",
+    finalPointsOutside
 )
 
 

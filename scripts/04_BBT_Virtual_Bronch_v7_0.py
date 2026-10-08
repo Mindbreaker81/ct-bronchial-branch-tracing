@@ -26,8 +26,9 @@
 #
 # Camera:
 #   1. Starts at tracheal end of Route_Centerline.
-#   2. Route direction is automatically chosen so that initial travel
-#      is preferentially HEAD -> FEET.
+#   2. Route direction is taken from BBT.RouteDirection when script 03
+#      set it; otherwise it is chosen so that initial travel is
+#      preferentially HEAD -> FEET.
 #   3. Forward vector follows Route_Centerline.
 #   4. Anatomical anterior defines initial camera "up".
 #   5. Camera frame is parallel transported with minimal twist.
@@ -89,6 +90,9 @@ ROLL_FINISH_BEFORE_MM = 2.0
 PAUSE_BEFORE_MM = 2.0
 
 PAUSE_SECONDS = 1.5
+
+# B1/B2/... markers farther than this from the route are ignored.
+MAX_MARKER_DISTANCE_MM = 10.0
 
 
 # =====================================================================
@@ -239,6 +243,29 @@ def wrapAngle(angle):
         )
 
     return angle
+
+
+def parseClockPosition(description):
+    """
+    Clock position 1-12 from a marker description.
+
+    Returns None when the description contains no clock value or
+    more than one distinct candidate, so that ambiguous text such as
+    "branch 6, 3 o'clock" is never silently misread.
+    """
+
+    values = {
+        int(value)
+        for value in re.findall(
+            r"\b(1[0-2]|[1-9])\b",
+            description or ""
+        )
+    }
+
+    if len(values) != 1:
+        return None
+
+    return values.pop()
 
 
 # =====================================================================
@@ -412,7 +439,22 @@ if reverseInitialVector is not None:
 routeWasReversed = False
 
 
-if reverseScore > forwardScore:
+# Routes created by script 03 record their direction explicitly.
+# The heuristic is only used for routes without that attribute.
+storedDirection = routeCurve.GetAttribute(
+    "BBT.RouteDirection"
+)
+
+directionIsStored = (
+    storedDirection == "StartToTarget"
+)
+
+
+if (
+    not directionIsStored
+    and
+    reverseScore > forwardScore
+):
 
     route = route[::-1].copy()
 
@@ -423,6 +465,9 @@ print("")
 print(
     "Route direction:",
     (
+        "kept as stored (BBT.RouteDirection = StartToTarget)"
+        if directionIsStored
+        else
         "REVERSED to favour head -> feet"
         if routeWasReversed
         else
@@ -987,26 +1032,21 @@ for node in markupNodes:
         pass
 
 
-    clockMatch = re.search(
-        r"\b(1[0-2]|[1-9])\b",
+    clockValue = parseClockPosition(
         description
     )
 
 
-    if clockMatch is None:
+    if clockValue is None:
 
         print(
             "WARNING:",
             nodeName,
-            "ignored because its description does not contain 1-12."
+            "ignored because its description does not contain "
+            "exactly one clock value 1-12."
         )
 
         continue
-
-
-    clockValue = int(
-        clockMatch.group(1)
-    )
 
 
     distances = np.linalg.norm(
@@ -1029,6 +1069,18 @@ for node in markupNodes:
             routeIndex
         ]
     )
+
+
+    if markerDistance > MAX_MARKER_DISTANCE_MM:
+
+        print(
+            "WARNING:",
+            nodeName,
+            f"ignored because it is {markerDistance:.1f} mm "
+            f"from the route (limit {MAX_MARKER_DISTANCE_MM:.1f} mm)."
+        )
+
+        continue
 
 
     # ================================================================
